@@ -1,0 +1,28 @@
+
+parameters:
+  - name: Environment
+    type: string
+    default: 'dev'
+
+# Load pipeline variables (service connection, backend config, paths, etc.)
+# Sensitive values (credentials) should come from a linked variable group, not this file.
+variables:
+  - template: variables/${{ parameters.Environment }}.yml
+
+
+stages:
+  - template: ../terraform-template.yml
+    parameters:
+      StageName: ${{ parameters.Environment }}_apply
+      Environment: ${{ parameters.Environment }}
+      ServiceConnectionName: $(ServiceConnectionName)
+      BackendResourceGroupName: $(BackendResourceGroupName)
+      BackendStorageAccountName: $(BackendStorageAccountName)
+      BackendContainerName: $(BackendContainerName)
+      BackendKey: $(BackendKey)
+      TerraformVersion: $(TerraformVersion)
+      TerraformWorkingDirectory: $(TerraformWorkingDirectory)
+      VarFiles:
+        - $(GlobalVarFile)
+        - $(DevVarFile)
+      NotifyUsers: $(NotifyUsers)

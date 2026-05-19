@@ -1,0 +1,42 @@
+parameters:
+  - name: Command
+    type: string
+    values:
+      - init
+      - validate
+      - plan
+      - apply
+      - destroy
+  - name: ServiceConnectionName
+    type: string
+  - name: WorkingDirectory
+    type: string
+  - name: BackendResourceGroupName
+    type: string
+  - name: BackendStorageAccountName
+    type: string
+  - name: BackendContainerName
+    type: string
+  - name: BackendKey
+    type: string
+  - name: CommandOptions
+    type: string
+    default: ''
+
+steps:
+  - task: TerraformTask@4
+    displayName: 'Terraform ${{ parameters.Command }}'
+    inputs:
+      command: ${{ parameters.Command }}
+      provider: azurerm
+      workingDirectory: ${{ parameters.WorkingDirectory }}
+      ${{ if eq(parameters.Command, 'init') }}:
+        backendServiceArm: ${{ parameters.ServiceConnectionName }}
+      ${{ else }}:
+        environmentServiceNameAzureRM: ${{ parameters.ServiceConnectionName }}
+      backendAzureRmResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+      backendAzureRmStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+      backendAzureRmContainerName: ${{ parameters.BackendContainerName }}
+      backendAzureRmKey: ${{ parameters.BackendKey }}
+      ${{ if ne(parameters.CommandOptions, '') }}:
+        commandOptions: ${{ parameters.CommandOptions }}

@@ -1,0 +1,129 @@
+parameters:
+  - name: Environment
+    type: string
+  - name: ServiceConnectionName
+    type: string
+
+  # Backend — all required, no defaults
+  - name: BackendResourceGroupName
+    type: string
+  - name: BackendStorageAccountName
+    type: string
+  - name: BackendContainerName
+    type: string
+  - name: BackendKey
+    type: string
+
+  # Terraform
+  - name: TerraformVersion
+    type: string
+    default: '1.6.3'
+  - name: TerraformWorkingDirectory
+    type: string
+    default: '$(System.DefaultWorkingDirectory)'
+  - name: VarFiles
+    type: object
+    default: []
+
+  # ADO integration
+  - name: VariableGroups
+    type: object
+    default: []
+  - name: EnvironmentVariables
+    type: object
+    default: {}
+
+  # Flow control
+  - name: PlanOnly
+    type: boolean
+    default: false
+  - name: AutoApprove
+    type: boolean
+    default: false
+  - name: Destroy
+    type: boolean
+    default: false
+  - name: NotifyUsers
+    type: string
+    default: ''
+
+  # State management
+  - name: UnlockState
+    type: boolean
+    default: false
+
+  # Stage config
+  - name: StageName
+    type: string
+    default: ''
+  - name: DependsOn
+    type: object
+    default: []
+
+  # Extension points
+  - name: PreInitSteps
+    type: stepList
+    default: []
+  - name: PostPlanSteps
+    type: stepList
+    default: []
+  - name: PostApplySteps
+    type: stepList
+    default: []
+
+stages:
+  - stage: ${{ coalesce(parameters.StageName, parameters.Environment) }}
+    ${{ if ne(convertToJson(parameters.DependsOn), '[]') }}:
+      dependsOn: ${{ parameters.DependsOn }}
+    condition: succeeded()
+
+    variables:
+      - ${{ each group in parameters.VariableGroups }}:
+        - group: ${{ group }}
+
+    jobs:
+      - template: jobs/tf-plan-job.yml
+        parameters:
+          Environment: ${{ parameters.Environment }}
+          ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+          BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+          BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+          BackendContainerName: ${{ parameters.BackendContainerName }}
+          BackendKey: ${{ parameters.BackendKey }}
+          TerraformVersion: ${{ parameters.TerraformVersion }}
+          TerraformWorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+          VarFiles: ${{ parameters.VarFiles }}
+          EnvironmentVariables: ${{ parameters.EnvironmentVariables }}
+          Destroy: ${{ parameters.Destroy }}
+          UnlockState: ${{ parameters.UnlockState }}
+          PreInitSteps: ${{ parameters.PreInitSteps }}
+          PostPlanSteps: ${{ parameters.PostPlanSteps }}
+
+      - ${{ if and(eq(parameters.PlanOnly, false), eq(parameters.AutoApprove, false)) }}:
+        - job: manual_approval
+          displayName: 'Manual Approval'
+          pool: server
+          dependsOn: tf_plan
+          condition: eq(dependencies.tf_plan.outputs['detect_changes.HAS_CHANGES'], 'true')
+          steps:
+            - task: ManualValidation@0
+              timeoutInMinutes: 1440
+              inputs:
+                notifyUsers: ${{ parameters.NotifyUsers }}
+                instructions: 'Review the Terraform plan output and approve or reject the deployment.'
+                onTimeout: 'reject'
+
+      - ${{ if eq(parameters.PlanOnly, false) }}:
+        - template: jobs/tf-apply-job.yml
+          parameters:
+            Environment: ${{ parameters.Environment }}
+            ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+            BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+            BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+            BackendContainerName: ${{ parameters.BackendContainerName }}
+            BackendKey: ${{ parameters.BackendKey }}
+            TerraformVersion: ${{ parameters.TerraformVersion }}
+            TerraformWorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+            EnvironmentVariables: ${{ parameters.EnvironmentVariables }}
+            AutoApprove: ${{ parameters.AutoApprove }}
+            PostApplySteps: ${{ parameters.PostApplySteps }}

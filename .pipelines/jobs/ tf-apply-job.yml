@@ -1,0 +1,100 @@
+parameters:
+  - name: Environment
+    type: string
+  - name: ServiceConnectionName
+    type: string
+  - name: BackendResourceGroupName
+    type: string
+  - name: BackendStorageAccountName
+    type: string
+  - name: BackendContainerName
+    type: string
+  - name: BackendKey
+    type: string
+  - name: TerraformVersion
+    type: string
+  - name: TerraformWorkingDirectory
+    type: string
+  - name: EnvironmentVariables
+    type: object
+    default: {}
+  - name: AutoApprove
+    type: boolean
+    default: false
+  - name: PostApplySteps
+    type: stepList
+    default: []
+
+jobs:
+  - deployment: tf_apply
+    displayName: 'Terraform Apply on ${{ parameters.Environment }}'
+    environment: ${{ parameters.Environment }}
+    ${{ if eq(parameters.AutoApprove, false) }}:
+      dependsOn:
+        - tf_plan
+        - manual_approval
+      condition: >-
+        and(
+          eq(dependencies.tf_plan.outputs['detect_changes.HAS_CHANGES'], 'true'),
+          or(
+            eq(dependencies.manual_approval.result, 'Succeeded'),
+            eq(dependencies.manual_approval.result, 'Skipped')
+          )
+        )
+    ${{ else }}:
+      dependsOn: tf_plan
+      condition: eq(dependencies.tf_plan.outputs['detect_changes.HAS_CHANGES'], 'true')
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            # Inject environment variables as pipeline variables for all subsequent steps
+            - ${{ each envVar in parameters.EnvironmentVariables }}:
+              - script: echo "##vso[task.setvariable variable=${{ envVar.key }}]${{ envVar.value }}"
+                displayName: 'Set env: ${{ envVar.key }}'
+
+            - template: ../../terraform-template/git-authentication.yml
+
+            - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+              displayName: 'Terraform Install'
+              inputs:
+                terraformVersion: ${{ parameters.TerraformVersion }}
+                allowTelemetryCollection: false
+
+            - download: current
+              artifact: '$(System.StageName)_plan_$(System.StageAttempt)'
+              displayName: 'Download plan artifact'
+
+            - task: CopyFiles@2
+              displayName: 'Copy plan artifact to working directory'
+              inputs:
+                SourceFolder: '$(Pipeline.Workspace)/$(System.StageName)_plan_$(System.StageAttempt)/'
+                Contents: '**'
+                TargetFolder: ${{ parameters.TerraformWorkingDirectory }}
+
+            - template: ../steps/terraform-task.yml
+              parameters:
+                Command: init
+                ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+                WorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+                BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+                BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+                BackendContainerName: ${{ parameters.BackendContainerName }}
+                BackendKey: ${{ parameters.BackendKey }}
+
+            - template: ../steps/terraform-task.yml
+              parameters:
+                Command: apply
+                ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+                WorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+                BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+                BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+                BackendContainerName: ${{ parameters.BackendContainerName }}
+                BackendKey: ${{ parameters.BackendKey }}
+                CommandOptions: >-
+                  -auto-approve
+                  "${{ parameters.TerraformWorkingDirectory }}/$(System.StageName).tfplan"
+
+            # Extension point: steps that run after apply completes
+            - ${{ each step in parameters.PostApplySteps }}:
+              - ${{ step }}

@@ -1,0 +1,179 @@
+parameters:
+  - name: Environment
+    type: string
+  - name: ServiceConnectionName
+    type: string
+  - name: BackendResourceGroupName
+    type: string
+  - name: BackendStorageAccountName
+    type: string
+  - name: BackendContainerName
+    type: string
+  - name: BackendKey
+    type: string
+  - name: TerraformVersion
+    type: string
+  - name: TerraformWorkingDirectory
+    type: string
+  - name: VarFiles
+    type: object
+    default: []
+  - name: EnvironmentVariables
+    type: object
+    default: {}
+  - name: Destroy
+    type: boolean
+    default: false
+  - name: UnlockState
+    type: boolean
+    default: false
+  - name: PreInitSteps
+    type: stepList
+    default: []
+  - name: PostPlanSteps
+    type: stepList
+    default: []
+
+jobs:
+  - job: tf_plan
+    displayName: 'Terraform Plan'
+    steps:
+
+      # Inject environment variables as pipeline variables (ADO exposes these as OS env vars to all subsequent steps)
+      - ${{ each envVar in parameters.EnvironmentVariables }}:
+        - script: echo "##vso[task.setvariable variable=${{ envVar.key }}]${{ envVar.value }}"
+          displayName: 'Set env: ${{ envVar.key }}'
+
+      - template: ../../terraform-template/git-authentication.yml
+
+      - task: ms-devlabs.custom-terraform-tasks.custom-terraform-installer-task.TerraformInstaller@1
+        displayName: 'Terraform Install'
+        inputs:
+          terraformVersion: ${{ parameters.TerraformVersion }}
+          allowTelemetryCollection: false
+
+      # Extension point: steps that run after checkout/install, before terraform init
+      - ${{ each step in parameters.PreInitSteps }}:
+        - ${{ step }}
+
+      # Optional: break blob lease on state file before init (idempotent)
+      - ${{ if parameters.UnlockState }}:
+        - pwsh: |
+            $ErrorActionPreference = 'Stop'
+            $leaseState = az storage blob show `
+              --name "${{ parameters.BackendKey }}" `
+              --container-name "${{ parameters.BackendContainerName }}" `
+              --account-name "${{ parameters.BackendStorageAccountName }}" `
+              --auth-mode login `
+              --query "properties.lease.state" -o tsv
+
+            if ($leaseState -eq "leased") {
+              Write-Host "Active lease detected, breaking lock..."
+              az storage blob lease break `
+                --blob-name "${{ parameters.BackendKey }}" `
+                --container-name "${{ parameters.BackendContainerName }}" `
+                --account-name "${{ parameters.BackendStorageAccountName }}" `
+                --auth-mode login
+              Write-Host "Lease broken successfully."
+            } else {
+              Write-Host "No active lease found (state: $leaseState). Nothing to unlock."
+            }
+          displayName: 'Unlock Terraform State'
+
+      - template: ../steps/terraform-task.yml
+        parameters:
+          Command: init
+          ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+          WorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+          BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+          BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+          BackendContainerName: ${{ parameters.BackendContainerName }}
+          BackendKey: ${{ parameters.BackendKey }}
+
+      - template: ../steps/terraform-task.yml
+        parameters:
+          Command: validate
+          ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+          WorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+          BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+          BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+          BackendContainerName: ${{ parameters.BackendContainerName }}
+          BackendKey: ${{ parameters.BackendKey }}
+
+      # Build -var-file argument string from VarFiles list; sets $(VarFileArgs) for use in plan CommandOptions
+      - pwsh: |
+          $varFileArgs = ""
+          if ('${{ convertToJson(parameters.VarFiles) }}' -ne '[]') {
+            $varFiles = '${{ convertToJson(parameters.VarFiles) }}' | ConvertFrom-Json
+            foreach ($vf in $varFiles) {
+              $varFileArgs += "-var-file=`"$vf`" "
+            }
+          }
+          Write-Host "##vso[task.setvariable variable=VarFileArgs]$($varFileArgs.Trim())"
+        displayName: 'Build var-file arguments'
+
+      - template: ../steps/terraform-task.yml
+        parameters:
+          Command: plan
+          ServiceConnectionName: ${{ parameters.ServiceConnectionName }}
+          WorkingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+          BackendResourceGroupName: ${{ parameters.BackendResourceGroupName }}
+          BackendStorageAccountName: ${{ parameters.BackendStorageAccountName }}
+          BackendContainerName: ${{ parameters.BackendContainerName }}
+          BackendKey: ${{ parameters.BackendKey }}
+          CommandOptions: >-
+            $(VarFileArgs)
+            -input=false ${{ iif(parameters.Destroy, '-destroy', '') }}
+            "-out=${{ parameters.TerraformWorkingDirectory }}/$(System.StageName).tfplan"
+
+      # Detect changes and destroys; sets isOutput variables consumed by stage template conditions
+      - pwsh: |
+          $ErrorActionPreference = 'Stop'
+          terraform show -json '${{ parameters.TerraformWorkingDirectory }}/$(System.StageName).tfplan' | Set-Content plan.json
+          if ($LASTEXITCODE -ne 0) { throw "terraform show failed with exit code $LASTEXITCODE" }
+
+          $planContent = Get-Content plan.json -Raw | ConvertFrom-Json
+          $resourceChanges = @($planContent.resource_changes)
+
+          if (-not $resourceChanges -or $resourceChanges.Count -eq 0) {
+            Write-Host 'No resource changes detected.'
+            Write-Host '##vso[task.setvariable variable=HAS_CHANGES;isOutput=true]false'
+            Write-Host '##vso[task.setvariable variable=HAS_DESTROY;isOutput=true]false'
+            return
+          }
+
+          $hasDestroy = $false
+          $hasChanges = $false
+
+          foreach ($rc in $resourceChanges) {
+            $actions = @($rc.change.actions)
+            if ($actions -and $actions.Count -gt 0 -and $actions -notcontains 'no-op') {
+              $hasChanges = $true
+            }
+            if ($actions -contains 'delete') {
+              $hasDestroy = $true
+            }
+          }
+
+          Write-Host "##vso[task.setvariable variable=HAS_CHANGES;isOutput=true]$($hasChanges.ToString().ToLower())"
+          Write-Host "##vso[task.setvariable variable=HAS_DESTROY;isOutput=true]$($hasDestroy.ToString().ToLower())"
+
+          if ($hasChanges) {
+            Write-Host "Terraform plan has changes. HAS_DESTROY=$hasDestroy"
+            if ($hasDestroy) {
+              Write-Host "##vso[task.logissue type=warning]Plan contains destroy actions — review carefully."
+            }
+          } else {
+            Write-Host 'No changes detected. Approval and apply will be skipped.'
+          }
+        displayName: 'Detect Terraform Plan Changes'
+        name: detect_changes
+        workingDirectory: ${{ parameters.TerraformWorkingDirectory }}
+
+      - publish: '${{ parameters.TerraformWorkingDirectory }}/$(System.StageName).tfplan'
+        artifact: '$(System.StageName)_plan_$(System.StageAttempt)'
+        displayName: 'Publish plan artifact'
+
+      # Extension point: steps that run after plan is published
+      - ${{ each step in parameters.PostPlanSteps }}:
+        - ${{ step }}
